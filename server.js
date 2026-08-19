@@ -88,6 +88,7 @@ app.get('/', (req, res) => {
       <div class="container">
         <h1>Stepwise WhatsApp Integration Background</h1>
         <p><span class="status-dot"></span> Backend Services Online</p>
+        <p style="margin-top: 2rem; font-size: 0.9rem; opacity: 0.7; font-weight: bold; text-transform: uppercase; letter-spacing: 2px;">(Don't delete this)</p>
       </div>
     </body>
     </html>
