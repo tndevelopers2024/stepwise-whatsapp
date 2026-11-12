@@ -125,20 +125,25 @@ const sendOrderShippedTrackingTemplate = async (to, customerName, orderNumber, p
 };
 
 const sendCodOrderConfirmation = async (to, customerName, orderNumber, productName, total, orderId, imageUrl) => {
+  const cleanTo = String(to || '').replace(/\D/g, '');
   const effectiveOrderId = orderId || `cod_${Date.now()}`;
+  const codTemplateName = process.env.WHATSAPP_COD_TEMPLATE_NAME || 'cod_order_confirmation';
 
-  // If a dedicated WhatsApp template is configured for COD, try that first
-  if (process.env.WHATSAPP_COD_TEMPLATE_NAME) {
+  // Clean total so it doesn't duplicate ₹ if template has ₹{{4}}
+  const cleanTotal = String(total || '').replace(/^(INR|₹)\s*/i, '').trim() || total || '';
+
+  // Try pre-approved WhatsApp template first (required for business-initiated messages outside 24h window)
+  if (codTemplateName && codTemplateName !== 'none') {
     try {
       const templatePayload = {
         messaging_product: 'whatsapp',
-        to,
+        to: cleanTo,
         type: 'template',
         template: {
-          name: process.env.WHATSAPP_COD_TEMPLATE_NAME,
+          name: codTemplateName,
           language: { code: WHATSAPP_TEMPLATE_LANG },
           components: [
-            ...(imageUrl ? [{
+            ...(process.env.WHATSAPP_COD_TEMPLATE_HAS_IMAGE === 'true' && imageUrl ? [{
               type: 'header',
               parameters: [{ type: 'image', image: { link: imageUrl } }]
             }] : []),
@@ -148,7 +153,7 @@ const sendCodOrderConfirmation = async (to, customerName, orderNumber, productNa
                 { type: 'text', text: customerName || 'Valued Customer' },
                 { type: 'text', text: orderNumber || '' },
                 { type: 'text', text: productName || 'Your Order' },
-                { type: 'text', text: total || '' }
+                { type: 'text', text: cleanTotal }
               ]
             },
             {
@@ -167,19 +172,20 @@ const sendCodOrderConfirmation = async (to, customerName, orderNumber, productNa
         }
       };
       const response = await axios.post(graphApiUrl, templatePayload, { headers: getHeaders() });
+      console.log(`[WhatsApp] Sent COD template "${codTemplateName}" to ${cleanTo}`);
       return response.data;
     } catch (templateError) {
-      console.warn('[WhatsApp] COD template failed or not found, falling back to interactive button message:', templateError.response?.data || templateError.message);
+      console.warn('[WhatsApp] COD template failed, falling back to interactive button message:', JSON.stringify(templateError.response?.data || templateError.message));
     }
   }
 
-  // WhatsApp Interactive Button Message
+  // WhatsApp Interactive Button Message (session fallback)
   const bodyText = `Hi ${customerName || 'Valued Customer'},\n\nThank you for placing order ${orderNumber} for ${productName || 'your items'}.\n\n*Total:* ${total || ''}\n*Payment Mode:* Cash on Delivery (COD)\n\nPlease click a button below to confirm or cancel your order:`;
 
   const interactivePayload = {
     messaging_product: 'whatsapp',
     recipient_type: 'individual',
-    to,
+    to: cleanTo,
     type: 'interactive',
     interactive: {
       type: 'button',
@@ -236,10 +242,11 @@ const sendCodOrderConfirmation = async (to, customerName, orderNumber, productNa
 };
 
 const sendTextMessage = async (to, text) => {
+  const cleanTo = String(to || '').replace(/\D/g, '');
   const payload = {
     messaging_product: 'whatsapp',
     recipient_type: 'individual',
-    to,
+    to: cleanTo,
     type: 'text',
     text: { body: text }
   };

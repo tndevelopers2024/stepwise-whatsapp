@@ -1,4 +1,8 @@
 const assert = require('assert');
+// Ensure tests run in simulated Shopify mode without hitting live Shopify OAuth
+process.env.SHOPIFY_CLIENT_ID = '';
+process.env.SHOPIFY_CLIENT_SECRET = '';
+process.env.SHOPIFY_ADMIN_ACCESS_TOKEN = '';
 const { 
   savePendingCodOrder, 
   findCodOrderById, 
