@@ -1,4 +1,6 @@
 node_modules/
 .env
 tracking_cache.json
+cod_orders_cache.json
+shopify_tokens.json
 .DS_Store

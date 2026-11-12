@@ -5,8 +5,22 @@ const path = require('path');
 const { 
   sendOrderTemplate, 
   sendOrderShippedTemplate, 
-  sendOrderShippedTrackingTemplate 
+  sendOrderShippedTrackingTemplate,
+  sendCodOrderConfirmation,
+  sendTextMessage
 } = require('../services/whatsapp');
+const {
+  markOrderCodPending,
+  confirmOrder,
+  cancelCodOrder
+} = require('../services/shopify');
+const {
+  savePendingCodOrder,
+  findCodOrderById,
+  findLatestPendingCodOrderByPhone,
+  updateCodOrderStatus,
+  loadCodCache
+} = require('../services/codCache');
 
 const router = express.Router();
 const TRACKING_CACHE_FILE = path.join(__dirname, '..', 'tracking_cache.json');
@@ -32,6 +46,51 @@ const saveCache = (cache) => {
   } catch (err) {
     console.error('Error writing cache:', err);
   }
+};
+
+// Helper to determine if an order is Cash on Delivery (COD)
+const isCodOrder = (order) => {
+  const customCodGateways = (process.env.COD_GATEWAY_NAMES || '')
+    .split(',')
+    .map(s => s.trim().toLowerCase())
+    .filter(Boolean);
+
+  const defaultCodKeywords = ['cod', 'cash on delivery', 'cash_on_delivery', 'cash', 'manual'];
+  const codKeywords = [...new Set([...defaultCodKeywords, ...customCodGateways])];
+
+  // 1. Check payment_gateway_names array
+  const gatewayNames = Array.isArray(order.payment_gateway_names)
+    ? order.payment_gateway_names.map(g => String(g).toLowerCase())
+    : [];
+
+  const matchedInGatewayNames = gatewayNames.some(name =>
+    codKeywords.some(keyword => name.includes(keyword))
+  );
+  if (matchedInGatewayNames) return true;
+
+  // 2. Check gateway string
+  const gateway = (order.gateway || '').toLowerCase();
+  if (gateway && codKeywords.some(keyword => gateway.includes(keyword))) {
+    return true;
+  }
+
+  // 3. Check tags
+  const tags = (order.tags || '').toLowerCase();
+  if (tags.includes('cod') || tags.includes('cash on delivery')) {
+    return true;
+  }
+
+  // 4. Check note_attributes
+  if (Array.isArray(order.note_attributes)) {
+    const isCodAttribute = order.note_attributes.some(attr => {
+      const name = (attr.name || '').toLowerCase();
+      const val = (attr.value || '').toLowerCase();
+      return (name.includes('payment') || name.includes('cod')) && (val.includes('cod') || val.includes('cash'));
+    });
+    if (isCodAttribute) return true;
+  }
+
+  return false;
 };
 
 // Common data extraction
@@ -89,6 +148,23 @@ router.post('/orders/create', async (req, res) => {
     return;
   }
 
+  // Check if order is Cash On Delivery (COD)
+  const isCod = isCodOrder(order);
+
+  // 1. If COD, save to cache immediately so order is recorded before any external async calls
+  if (isCod) {
+    savePendingCodOrder({
+      orderId: order.id,
+      orderNumber,
+      phone,
+      customerName,
+      productName,
+      total,
+      storeDomain
+    });
+    console.log(`[orders/create] Detected COD order ${orderNumber} (ID: ${order.id}) for ${customerName}`);
+  }
+
   // Extract Image
   let imageUrl = null;
   const firstItem = order.line_items && order.line_items[0];
@@ -118,11 +194,29 @@ router.post('/orders/create', async (req, res) => {
     }
   }
 
-  try {
-    await sendOrderTemplate(phone, customerName, orderNumber, productName, total, imageUrl);
-    console.log(`[orders/create] Sent order confirmation to ${phone} for ${orderNumber}`);
-  } catch (err) {
-    console.error(`[orders/create] Failed to send to ${phone}`, err);
+  if (isCod) {
+    // 2. Mark order as COD-Pending in Shopify
+    try {
+      await markOrderCodPending(order.id, storeDomain);
+    } catch (err) {
+      console.error(`[orders/create] Failed to mark order ${order.id} as COD-Pending:`, err.message);
+    }
+
+    // 3. Send WhatsApp message with Confirm Order and Cancel Order buttons
+    try {
+      await sendCodOrderConfirmation(phone, customerName, orderNumber, productName, total, order.id, imageUrl);
+      console.log(`[orders/create] Sent COD confirmation buttons to ${phone} for ${orderNumber}`);
+    } catch (err) {
+      console.error(`[orders/create] Failed to send COD confirmation to ${phone}:`, err);
+    }
+  } else {
+    // Non-COD order: preserve existing order confirmation template behavior
+    try {
+      await sendOrderTemplate(phone, customerName, orderNumber, productName, total, imageUrl);
+      console.log(`[orders/create] Sent order confirmation to ${phone} for ${orderNumber}`);
+    } catch (err) {
+      console.error(`[orders/create] Failed to send to ${phone}`, err);
+    }
   }
 });
 
@@ -188,6 +282,199 @@ router.post('/orders/updated', async (req, res) => {
       }
     }
   }
+});
+
+// WhatsApp Webhook Verification Endpoint (Meta Challenge)
+const handleWhatsAppVerification = (req, res) => {
+  const mode = req.query['hub.mode'];
+  const token = req.query['hub.verify_token'];
+  const challenge = req.query['hub.challenge'];
+
+  const expectedVerifyToken = process.env.WHATSAPP_VERIFY_TOKEN || 'stepwise_webhook_verify_token';
+
+  if (mode && token) {
+    if (mode === 'subscribe' && token === expectedVerifyToken) {
+      console.log('[whatsapp/webhook] Webhook verified successfully by Meta.');
+      return res.status(200).send(challenge);
+    } else {
+      console.warn('[whatsapp/webhook] Webhook verification failed: verify_token mismatch.');
+      return res.sendStatus(403);
+    }
+  }
+  return res.sendStatus(400);
+};
+
+// WhatsApp Webhook Incoming Events Endpoint (Customer Responses)
+const handleWhatsAppIncomingMessage = async (req, res) => {
+  // Always respond immediately with 200 OK so Meta does not retry
+  res.sendStatus(200);
+
+  const body = req.body;
+  if (!body || !body.entry) {
+    return;
+  }
+
+  try {
+    for (const entry of body.entry) {
+      const changes = entry.changes || [];
+      for (const change of changes) {
+        const value = change.value;
+        if (!value || !value.messages || !Array.isArray(value.messages)) {
+          continue; // Delivery receipts, read receipts, or non-message changes
+        }
+
+        for (const message of value.messages) {
+          const from = message.from; // Customer phone e.g. "919876543210"
+          let action = null; // 'confirm' or 'cancel'
+          let orderId = null;
+
+          // 1. Check for interactive button click
+          if (message.type === 'interactive' && message.interactive) {
+            const buttonReply = message.interactive.button_reply;
+            if (buttonReply) {
+              const buttonId = buttonReply.id || '';
+              if (buttonId.startsWith('cod_confirm_')) {
+                action = 'confirm';
+                orderId = buttonId.replace('cod_confirm_', '');
+              } else if (buttonId.startsWith('cod_cancel_')) {
+                action = 'cancel';
+                orderId = buttonId.replace('cod_cancel_', '');
+              }
+            }
+          }
+          // 2. Check for template quick reply button click
+          else if (message.type === 'button' && message.button) {
+            const payload = message.button.payload || message.button.text || '';
+            if (payload.startsWith('cod_confirm_') || payload.toLowerCase().includes('confirm')) {
+              action = 'confirm';
+              orderId = payload.startsWith('cod_confirm_') ? payload.replace('cod_confirm_', '') : null;
+            } else if (payload.startsWith('cod_cancel_') || payload.toLowerCase().includes('cancel')) {
+              action = 'cancel';
+              orderId = payload.startsWith('cod_cancel_') ? payload.replace('cod_cancel_', '') : null;
+            }
+          }
+          // 3. Check for text message reply (e.g. "Confirm", "Cancel", "Yes", "No")
+          else if (message.type === 'text' && message.text) {
+            const text = (message.text.body || '').trim().toLowerCase();
+            const confirmKeywords = ['confirm', 'confirm order', 'yes', '1', 'ha', 'haa', 'ok', 'accept'];
+            const cancelKeywords = ['cancel', 'cancel order', 'no', '2', 'nahi', 'reject'];
+
+            if (confirmKeywords.includes(text)) {
+              action = 'confirm';
+            } else if (cancelKeywords.includes(text)) {
+              action = 'cancel';
+            }
+          }
+
+          if (!action) {
+            continue; // Not a COD action response
+          }
+
+          console.log(`[whatsapp/webhook] Customer ${from} selected action: "${action}", orderId: ${orderId || 'searching cache'}`);
+
+          // Resolve order from cache or button ID
+          let orderRecord = orderId ? findCodOrderById(orderId) : null;
+          if (!orderRecord) {
+            orderRecord = findLatestPendingCodOrderByPhone(from);
+          }
+
+          const targetOrderId = orderId || (orderRecord && orderRecord.orderId);
+          const storeDomain = orderRecord?.storeDomain;
+          const customerName = orderRecord?.customerName || 'Valued Customer';
+          const orderNumber = orderRecord?.orderNumber || (targetOrderId ? `#${targetOrderId}` : '');
+          const productName = orderRecord?.productName || 'Your Order';
+
+          if (!targetOrderId) {
+            console.warn(`[whatsapp/webhook] Could not resolve pending order for customer ${from}`);
+            await sendTextMessage(
+              from,
+              `Thank you for reaching out! We couldn't find an active pending COD order for your number. If you need any assistance, our support team is happy to help.`
+            );
+            continue;
+          }
+
+          // Handle Action: CONFIRM
+          if (action === 'confirm') {
+            if (orderRecord && orderRecord.status === 'confirmed') {
+              await sendTextMessage(
+                from,
+                `Hi ${customerName}, your order *${orderNumber}* is already confirmed! We're processing it for shipment. 🚚`
+              );
+              continue;
+            }
+
+            console.log(`[whatsapp/webhook] Confirming order ${targetOrderId} (${orderNumber}) for ${from}`);
+
+            // Update Shopify Order Status (Tags: COD-Confirmed, Timeline Note)
+            try {
+              await confirmOrder(targetOrderId, storeDomain);
+            } catch (err) {
+              console.error(`[whatsapp/webhook] Failed to update Shopify status for order ${targetOrderId}:`, err.message);
+            }
+
+            // Update local cache status
+            updateCodOrderStatus(targetOrderId, 'confirmed');
+
+            // Send WhatsApp confirmation acknowledgement
+            try {
+              await sendTextMessage(
+                from,
+                `✅ *Order Confirmed!*\n\nThank you, ${customerName}! Your COD order *${orderNumber}* for *${productName}* has been confirmed.\n\nWe will pack your items and send you a tracking link as soon as it ships!`
+              );
+            } catch (err) {
+              console.error(`[whatsapp/webhook] Failed to send confirmation message to ${from}:`, err.message);
+            }
+          }
+          // Handle Action: CANCEL
+          else if (action === 'cancel') {
+            if (orderRecord && orderRecord.status === 'cancelled') {
+              await sendTextMessage(
+                from,
+                `Hi ${customerName}, your order *${orderNumber}* was already cancelled.`
+              );
+              continue;
+            }
+
+            console.log(`[whatsapp/webhook] Cancelling order ${targetOrderId} (${orderNumber}) for ${from}`);
+
+            // Cancel Order in Shopify (API cancel + Tags: COD-Cancelled, Timeline Note)
+            try {
+              await cancelCodOrder(targetOrderId, storeDomain, 'customer');
+            } catch (err) {
+              console.error(`[whatsapp/webhook] Failed to cancel Shopify order ${targetOrderId}:`, err.message);
+            }
+
+            // Update local cache status
+            updateCodOrderStatus(targetOrderId, 'cancelled');
+
+            // Send WhatsApp cancellation acknowledgement
+            try {
+              await sendTextMessage(
+                from,
+                `❌ *Order Cancelled*\n\nYour COD order *${orderNumber}* has been successfully cancelled as requested.\n\nIf you changed your mind, feel free to visit our store to place a new order anytime!`
+              );
+            } catch (err) {
+              console.error(`[whatsapp/webhook] Failed to send cancellation message to ${from}:`, err.message);
+            }
+          }
+        }
+      }
+    }
+  } catch (error) {
+    console.error('[whatsapp/webhook] Error processing incoming webhook:', error);
+  }
+};
+
+// WhatsApp Webhook Routes
+router.get('/whatsapp', handleWhatsAppVerification);
+router.post('/whatsapp', handleWhatsAppIncomingMessage);
+// Register aliases for /whatsapp/webhook
+router.get('/whatsapp/webhook', handleWhatsAppVerification);
+router.post('/whatsapp/webhook', handleWhatsAppIncomingMessage);
+
+// Cache inspection endpoint
+router.get('/cod-orders', (req, res) => {
+  res.status(200).json({ orders: loadCodCache() });
 });
 
 module.exports = router;

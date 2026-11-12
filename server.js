@@ -2,7 +2,12 @@ require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
 const webhookRoutes = require('./routes/webhook');
-const { sendOrderTemplate } = require('./services/whatsapp');
+const { 
+  sendOrderTemplate, 
+  sendCodOrderConfirmation, 
+  sendTextMessage 
+} = require('./services/whatsapp');
+const { exchangeOAuthCode } = require('./services/shopify');
 
 const app = express();
 const PORT = process.env.PORT || 5000;
@@ -17,8 +22,32 @@ app.use((req, res, next) => {
   next();
 });
 
-// Stylish Splash Page Endpoint
-app.get('/', (req, res) => {
+// Stylish Splash Page Endpoint (also handles Shopify OAuth callback if ?code=&shop= is present)
+app.get('/', async (req, res) => {
+  const { code, shop } = req.query;
+
+  if (code && shop) {
+    try {
+      await exchangeOAuthCode(shop, code);
+      return res.send(`
+        <!DOCTYPE html>
+        <html lang="en">
+        <head><meta charset="UTF-8"><title>Shopify App Connected</title></head>
+        <body style="font-family: sans-serif; display: flex; justify-content: center; align-items: center; height: 100vh; background: #075E54; color: white; text-align: center;">
+          <div>
+            <h1>✅ Shopify Store Connected!</h1>
+            <p>Store <strong>${shop}</strong> has been successfully authorized for WhatsApp COD Automation.</p>
+            <p>You can close this tab and return to your Shopify Admin.</p>
+          </div>
+        </body>
+        </html>
+      `);
+    } catch (err) {
+      console.error('[Shopify OAuth] Callback error:', err.message);
+      return res.status(500).send(`<h1>OAuth Error</h1><p>${err.message}</p>`);
+    }
+  }
+
   const html = `
     <!DOCTYPE html>
     <html lang="en">
@@ -117,6 +146,30 @@ app.post('/api/whatsapp/order-confirmation', async (req, res) => {
 
   try {
     const result = await sendOrderTemplate(to, customerName, orderNumber, productName, total, imageUrl);
+    res.status(200).json({ success: true, result });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// Test Endpoint to trigger Meta COD Confirmation directly with Confirm/Cancel buttons
+app.post('/api/whatsapp/cod-confirmation', async (req, res) => {
+  const { to, customerName, orderNumber, productName, total, orderId, imageUrl } = req.body;
+  
+  if (!to) {
+    return res.status(400).json({ error: 'Missing "to" (phone number) in request body.' });
+  }
+
+  try {
+    const result = await sendCodOrderConfirmation(
+      to,
+      customerName || 'Valued Customer',
+      orderNumber || '#1001',
+      productName || 'Test Product',
+      total || '₹999.00',
+      orderId || `test_${Date.now()}`,
+      imageUrl
+    );
     res.status(200).json({ success: true, result });
   } catch (error) {
     res.status(500).json({ success: false, error: error.message });
