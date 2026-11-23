@@ -73,7 +73,7 @@ const server = app.listen(0, async () => {
       whatsappNumber: '9876543210',
       appointmentDate: '28/11/2026',
       timeSlot: '10:00 AM - 01:00 PM (Morning)',
-      amount: '₹1.00',
+      amount: '₹99.00',
       paymentId: 'pay_xxxxxxxxxxxx',
       status: 'PAID',
       timestamp: '2026-11-23T11:42:32.000Z'
@@ -91,9 +91,10 @@ const server = app.listen(0, async () => {
     assert.strictEqual(postRes.data.bookingRef, '#SW-1058');
     assert.strictEqual(postRes.data.whatsappNumber, '919876543210'); // sanitized with 91 prefix
     assert.strictEqual(postRes.data.patientName, 'Patient Full Name');
+    assert.strictEqual(postRes.data.amount, '₹99');
     assert.ok(postRes.data.timestampIST.includes('IST'));
     assert.strictEqual(postRes.headers['access-control-allow-origin'], '*');
-    console.log('✔ Successful booking POST passed! Extracted and sanitized mobile with 91 prefix.');
+    console.log('✔ Successful booking POST passed! Extracted and sanitized mobile with 91 prefix and ₹99 amount.');
 
     // Test 5: Deduplication Check
     console.log('\n[Test 5] Testing deduplication of duplicate POST request...');
