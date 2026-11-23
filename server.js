@@ -204,6 +204,10 @@ app.post('/api/whatsapp/booking-confirmation', async (req, res) => {
   }
 });
 
+// Mount Direct Booking Endpoint (for Shopify landing page Razorpay payment)
+const assessmentBookingRoutes = require('./routes/assessmentBooking');
+app.use('/api/assessment-booking', assessmentBookingRoutes);
+
 // Mount Webhook Routes
 app.use('/api/webhooks', webhookRoutes);
 

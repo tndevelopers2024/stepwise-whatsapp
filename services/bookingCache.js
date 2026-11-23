@@ -31,35 +31,53 @@ const saveBookingsCache = (cache) => {
 };
 
 /**
- * Check if an order ID has already been processed for booking confirmation
+ * Check if an order ID or payment ID has already been processed for booking confirmation
  */
-const isBookingProcessed = (orderId) => {
-  if (!orderId) return false;
+const isBookingProcessed = (orderId, paymentId = null) => {
+  if (!orderId && !paymentId) return false;
   const cache = loadBookingsCache();
-  const idStr = String(orderId);
-  return cache.some(item => (typeof item === 'object' ? String(item.orderId) === idStr : String(item) === idStr));
+  const idStr = orderId ? String(orderId).trim() : null;
+  const payStr = paymentId ? String(paymentId).trim() : null;
+
+  return cache.some(item => {
+    if (typeof item === 'object') {
+      const matchOrderId = idStr && (
+        String(item.orderId || '').trim() === idStr ||
+        String(item.orderNumber || '').trim() === idStr ||
+        String(item.bookingRef || '').trim() === idStr
+      );
+      const matchPaymentId = payStr && String(item.paymentId || '').trim() === payStr;
+      return Boolean(matchOrderId || matchPaymentId);
+    }
+    return idStr && String(item).trim() === idStr;
+  });
 };
 
 /**
  * Mark an order ID as processed
  */
 const markBookingProcessed = (orderId, details = {}) => {
-  if (!orderId) return;
+  if (!orderId && !details.paymentId && !details.bookingRef) return;
   const cache = loadBookingsCache();
-  const idStr = String(orderId);
+  const idStr = String(orderId || details.bookingRef || details.paymentId);
 
   const existingIndex = cache.findIndex(item => 
-    (typeof item === 'object' ? String(item.orderId) === idStr : String(item) === idStr)
+    typeof item === 'object' 
+      ? (String(item.orderId) === idStr || (details.paymentId && String(item.paymentId) === String(details.paymentId)))
+      : String(item) === idStr
   );
 
   const record = {
     orderId: idStr,
-    orderNumber: details.orderNumber || '',
+    bookingRef: details.bookingRef || details.orderNumber || idStr,
+    orderNumber: details.orderNumber || details.bookingRef || idStr,
+    paymentId: details.paymentId || '',
     phone: details.phone || '',
     patientName: details.patientName || '',
     appointmentDate: details.appointmentDate || '',
     timeSlot: details.timeSlot || '',
     amount: details.amount || '',
+    status: details.status || 'PAID',
     processedAt: new Date().toISOString()
   };
 

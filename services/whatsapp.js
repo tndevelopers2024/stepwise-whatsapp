@@ -266,15 +266,21 @@ const sendBookingConfirmationMessage = async ({
   orderId,
   appointmentDate,
   timeSlot,
-  amount
+  amount,
+  paymentId,
+  status,
+  includeFootwearAdvice = true
 }) => {
   const cleanTo = String(to || '').replace(/\D/g, '');
   // Strip currency symbol and trailing .00 so ₹{{5}} renders as ₹99 instead of ₹₹99.00
   const cleanAmount = String(amount || '').replace(/^(INR|₹|\s)+/i, '').replace(/\.00$/, '').trim();
-  const mapsUrl = process.env.STEPWISE_CLINIC_MAPS_URL || 'https://maps.app.goo.gl/2HauavmrDLyvv9BZ6';
+  const mapsUrl = process.env.STEPWISE_CLINIC_MAPS_URL || 'https://maps.google.com/?q=StepWise+Health+Adyar+Chennai';
+  const phoneContact = process.env.STEPWISE_CLINIC_PHONE || '9894399107';
   const bookingTemplateName = process.env.WHATSAPP_BOOKING_TEMPLATE_NAME || 'foot_health_assessment_booking';
 
-  // If an approved Meta utility template is configured, try template first
+  let templateSentSuccessfully = false;
+
+  // 1. Send via approved Meta Utility Template if configured (reaches users outside 24h window)
   if (bookingTemplateName) {
     try {
       const templatePayload = {
@@ -300,31 +306,100 @@ const sendBookingConfirmationMessage = async ({
       };
       const response = await axios.post(graphApiUrl, templatePayload, { headers: getHeaders() });
       console.log(`[WhatsApp] Sent booking confirmation template "${bookingTemplateName}" to ${cleanTo}`);
+      templateSentSuccessfully = true;
+
+      // If footwear advice is requested and template sent, also send helpful advice tip as a follow-up
+      if (includeFootwearAdvice) {
+        try {
+          const adviceText = 
+`👟 *Clinic Recommendation:*
+Please bring your regular daily footwear (office shoes/walking shoes) for wear pattern analysis.
+
+📞 *Need help or rescheduling?*
+Call or WhatsApp us at +91 ${phoneContact}.`;
+          await sendTextMessage(cleanTo, adviceText);
+        } catch (adviceErr) {
+          console.warn('[WhatsApp] Follow-up footwear advice could not be sent (24h window closed):', adviceErr.message);
+        }
+      }
+
       return response.data;
     } catch (templateError) {
-      console.warn('[WhatsApp] Booking template failed or not found, falling back to text message:', templateError.response?.data || templateError.message);
+      console.warn('[WhatsApp] Booking template failed or not found, falling back to rich text message:', templateError.response?.data || templateError.message);
     }
   }
 
-  // Fallback text message matching the exact Meta approved template format
+  // 2. Fallback text message with complete booking details & clinic advice
   const messageText = 
-`*Booking Confirmed*
+`*Booking Confirmed - StepWise Health*
 
 Hello ${patientName || 'Valued Patient'},
 
-Your Foot Health Assessment (3D Optical Scan + Neuropathy Screening) at StepWise Health is confirmed!
+Your Foot Health Assessment (3D Scan + Neuropathy Screening) at StepWise Health is confirmed!
 
-Booking Details:
-• Order ID: ${orderId}
+📋 *Booking Details:*
+• Booking ID: ${orderId}
 • Appointment Date: ${appointmentDate}
 • Time Slot: ${timeSlot}
 • Session Duration: Approx. 15–20 minutes (Painless & Non-Invasive)
-• Amount Paid: ₹${cleanAmount || '99'}
+• Amount Paid: ₹${cleanAmount || '99'}${status ? ` (${status})` : ''}${paymentId ? `\n• Payment ID: ${paymentId}` : ''}
 
-Google Maps:
-${mapsUrl}`;
+📍 *Store Location:*
+StepWise Health Experience Store
+1st Floor, Adyar, Chennai
+Google Maps: ${mapsUrl}
+
+👟 *Clinic Recommendation:*
+Please bring your regular daily footwear (office shoes/walking shoes) for wear pattern analysis.
+
+📞 *Need to Reschedule or Have Questions?*
+Reply directly to this WhatsApp message or call us at +91 ${phoneContact}.
+
+We look forward to seeing you!`;
 
   return sendTextMessage(cleanTo, messageText);
+};
+
+/**
+ * Send an alert message to clinic staff about a new assessment booking
+ */
+const sendClinicAlert = async ({
+  clinicPhone,
+  bookingRef,
+  patientName,
+  whatsappNumber,
+  appointmentDate,
+  timeSlot,
+  amount,
+  paymentId,
+  status,
+  timestampIST
+}) => {
+  const targetPhone = String(clinicPhone || process.env.STEPWISE_CLINIC_PHONE || '9894399107').replace(/\D/g, '');
+  const cleanClinicPhone = targetPhone.length === 10 ? '91' + targetPhone : targetPhone;
+
+  const alertText = 
+`🚨 *New Foot Assessment Booking Alert!*
+
+A new booking was just paid via the landing page:
+
+• *Booking Ref:* ${bookingRef || 'N/A'}
+• *Patient Name:* ${patientName || 'N/A'}
+• *WhatsApp Number:* +${whatsappNumber || 'N/A'}
+• *Appointment Date:* ${appointmentDate || 'N/A'}
+• *Time Slot:* ${timeSlot || 'N/A'}
+• *Amount:* ${amount || 'N/A'} (${status || 'PAID'})
+• *Payment ID:* ${paymentId || 'N/A'}
+• *Booked At:* ${timestampIST || new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })}`;
+
+  try {
+    const res = await sendTextMessage(cleanClinicPhone, alertText);
+    console.log(`[WhatsApp] Sent clinic alert to ${cleanClinicPhone} for ${bookingRef}`);
+    return res;
+  } catch (err) {
+    console.warn(`[WhatsApp] Clinic alert could not be sent to ${cleanClinicPhone} (ensure 24h window or approved staff template):`, err.response?.data || err.message);
+    return null;
+  }
 };
 
 module.exports = {
@@ -333,5 +408,6 @@ module.exports = {
   sendOrderShippedTrackingTemplate,
   sendCodOrderConfirmation,
   sendTextMessage,
-  sendBookingConfirmationMessage
+  sendBookingConfirmationMessage,
+  sendClinicAlert
 };
