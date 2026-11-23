@@ -5,7 +5,8 @@ const webhookRoutes = require('./routes/webhook');
 const { 
   sendOrderTemplate, 
   sendCodOrderConfirmation, 
-  sendTextMessage 
+  sendTextMessage,
+  sendBookingConfirmationMessage 
 } = require('./services/whatsapp');
 const { exchangeOAuthCode } = require('./services/shopify');
 
@@ -14,7 +15,11 @@ const PORT = process.env.PORT || 5000;
 
 // Middleware
 app.use(cors());
-app.use(express.json());
+app.use(express.json({
+  verify: (req, res, buf) => {
+    req.rawBody = buf;
+  }
+}));
 
 // Request Logger
 app.use((req, res, next) => {
@@ -170,6 +175,29 @@ app.post('/api/whatsapp/cod-confirmation', async (req, res) => {
       orderId || `test_${Date.now()}`,
       imageUrl
     );
+    res.status(200).json({ success: true, result });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// Test Endpoint to trigger Foot Health Assessment Booking Confirmation directly
+app.post('/api/whatsapp/booking-confirmation', async (req, res) => {
+  const { to, patientName, orderNumber, appointmentDate, timeSlot, amount } = req.body;
+
+  if (!to) {
+    return res.status(400).json({ error: 'Missing "to" (phone number) in request body.' });
+  }
+
+  try {
+    const result = await sendBookingConfirmationMessage({
+      to,
+      patientName: patientName || 'Valued Patient',
+      orderId: orderNumber || '#1057',
+      appointmentDate: appointmentDate || '25/11/2026',
+      timeSlot: timeSlot || '10:00 AM - 01:00 PM (Morning)',
+      amount: amount || '99'
+    });
     res.status(200).json({ success: true, result });
   } catch (error) {
     res.status(500).json({ success: false, error: error.message });

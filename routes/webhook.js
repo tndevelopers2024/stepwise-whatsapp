@@ -2,12 +2,14 @@ const express = require('express');
 const axios = require('axios');
 const fs = require('fs');
 const path = require('path');
+const crypto = require('crypto');
 const { 
   sendOrderTemplate, 
   sendOrderShippedTemplate, 
   sendOrderShippedTrackingTemplate,
   sendCodOrderConfirmation,
-  sendTextMessage
+  sendTextMessage,
+  sendBookingConfirmationMessage
 } = require('../services/whatsapp');
 const {
   markOrderCodPending,
@@ -21,6 +23,11 @@ const {
   updateCodOrderStatus,
   loadCodCache
 } = require('../services/codCache');
+const {
+  isBookingProcessed,
+  markBookingProcessed,
+  loadBookingsCache
+} = require('../services/bookingCache');
 
 const router = express.Router();
 const TRACKING_CACHE_FILE = path.join(__dirname, '..', 'tracking_cache.json');
@@ -93,6 +100,20 @@ const isCodOrder = (order) => {
   return false;
 };
 
+// Helper to check if line item is Foot Health Assessment (handles URL: /products/foot-health-assessment-3d-scan-neuropathy-screening)
+const isAssessmentBookingItem = (item) => {
+  if (!item) return false;
+  const targetHandle = 'foot-health-assessment-3d-scan-neuropathy-screening';
+  const handle = String(item.handle || item.product_handle || '').trim().toLowerCase();
+  const title = String(item.title || item.name || '').trim().toLowerCase();
+
+  return (
+    handle === targetHandle ||
+    title.includes('foot health assessment') ||
+    title.includes('3d scan')
+  );
+};
+
 // Common data extraction
 const extractCommonData = (order) => {
   // Phone extraction
@@ -145,6 +166,14 @@ router.post('/orders/create', async (req, res) => {
 
   if (!phone) {
     console.warn(`[orders/create] No phone number found for order ${orderNumber}`);
+    return;
+  }
+
+  // If order is for Foot Health Assessment booking, skip generic ecommerce order template
+  // (The dedicated appointment confirmation template will be sent via /shopify/order-paid)
+  const lineItems = Array.isArray(order.line_items) ? order.line_items : [];
+  if (lineItems.some(isAssessmentBookingItem)) {
+    console.log(`[orders/create] Order ${orderNumber} is for Foot Health Assessment booking. Skipping generic order template.`);
     return;
   }
 
@@ -232,6 +261,13 @@ router.post('/orders/fulfilled', async (req, res) => {
     return;
   }
 
+  // Skip shipping template for Foot Health Assessment bookings
+  const lineItems = Array.isArray(order.line_items) ? order.line_items : [];
+  if (lineItems.some(isAssessmentBookingItem)) {
+    console.log(`[orders/fulfilled] Order ${orderNumber} is for Foot Health Assessment booking. Skipping shipping template.`);
+    return;
+  }
+
   try {
     await sendOrderShippedTemplate(phone, customerName, orderNumber, productName, total);
     console.log(`[orders/fulfilled] Sent order shipped to ${phone} for ${orderNumber}`);
@@ -249,6 +285,12 @@ router.post('/orders/updated', async (req, res) => {
 
   if (!phone) {
     console.warn(`[orders/updated] No phone number found for order ${orderNumber}`);
+    return;
+  }
+
+  // Skip tracking update for Foot Health Assessment bookings
+  const lineItems = Array.isArray(order.line_items) ? order.line_items : [];
+  if (lineItems.some(isAssessmentBookingItem)) {
     return;
   }
 
@@ -475,6 +517,220 @@ router.post('/whatsapp/webhook', handleWhatsAppIncomingMessage);
 // Cache inspection endpoint
 router.get('/cod-orders', (req, res) => {
   res.status(200).json({ orders: loadCodCache() });
+});
+
+// ==========================================
+// Foot Health Assessment Booking Integration
+// ==========================================
+
+// Helper to extract booking properties from line item properties
+const extractBookingProperty = (properties, keys) => {
+  if (!properties) return null;
+
+  if (Array.isArray(properties)) {
+    for (const key of keys) {
+      const prop = properties.find(p => 
+        p && typeof p.name === 'string' && p.name.trim().toLowerCase() === key.toLowerCase()
+      );
+      if (prop && prop.value !== undefined && prop.value !== null && String(prop.value).trim() !== '') {
+        return String(prop.value).trim();
+      }
+    }
+  } else if (typeof properties === 'object') {
+    for (const key of keys) {
+      for (const [propKey, propVal] of Object.entries(properties)) {
+        if (propKey.trim().toLowerCase() === key.toLowerCase() && propVal !== undefined && propVal !== null && String(propVal).trim() !== '') {
+          return String(propVal).trim();
+        }
+      }
+    }
+  }
+  return null;
+};
+
+// Helper to format India phone number with '91' prefix
+const formatIndiaPhone = (rawPhone) => {
+  if (!rawPhone) return null;
+  let digits = String(rawPhone).replace(/\D/g, '');
+  if (digits.length === 10) {
+    return '91' + digits;
+  }
+  if (digits.length === 11 && digits.startsWith('0')) {
+    return '91' + digits.slice(1);
+  }
+  if (digits.length === 12 && digits.startsWith('91')) {
+    return digits;
+  }
+  return digits;
+};
+
+// Helper to verify Shopify HMAC SHA256 signature
+const verifyShopifyHmac = (req) => {
+  const secret = (process.env.SHOPIFY_WEBHOOK_SECRET || process.env.SHOPIFY_SIGNING_SECRET || '').trim();
+  if (!secret) {
+    // Secret not set in .env yet; allow request and log warning
+    return true;
+  }
+
+  const hmacHeader = req.headers['x-shopify-hmac-sha256'];
+  if (!hmacHeader) {
+    console.warn('[shopify/order-paid] Missing X-Shopify-Hmac-Sha256 header.');
+    return false;
+  }
+
+  try {
+    const rawBody = req.rawBody ? req.rawBody : Buffer.from(JSON.stringify(req.body));
+    const generatedHash = crypto
+      .createHmac('sha256', secret)
+      .update(rawBody)
+      .digest('base64');
+
+    return crypto.timingSafeEqual(Buffer.from(generatedHash), Buffer.from(hmacHeader));
+  } catch (err) {
+    console.error('[shopify/order-paid] HMAC verification error:', err.message);
+    return false;
+  }
+};
+
+// Shopify Order Paid Webhook Handler
+const handleShopifyOrderPaid = async (req, res) => {
+  // 1. HMAC Verification
+  if (!verifyShopifyHmac(req)) {
+    console.warn('[shopify/order-paid] HMAC signature verification failed. Rejecting request.');
+    return res.status(401).send('Unauthorized: Invalid HMAC signature');
+  }
+
+  const order = req.body;
+  if (!order || !order.id) {
+    return res.status(400).send('Bad Request: Missing order payload');
+  }
+
+  const orderId = String(order.id);
+  const orderNumber = order.name || (order.order_number ? `#${order.order_number}` : `#${orderId}`);
+
+  // 2. Deduplication check
+  if (isBookingProcessed(orderId)) {
+    console.log(`[shopify/order-paid] Order ${orderNumber} (${orderId}) already processed. Skipping duplicate webhook.`);
+    return res.status(200).json({ status: 'ignored', message: 'Order already processed' });
+  }
+
+  // 3. Product Filter: Only trigger for Assessment bookings
+  const lineItems = Array.isArray(order.line_items) ? order.line_items : [];
+  const assessmentItem = lineItems.find(isAssessmentBookingItem);
+
+  if (!assessmentItem) {
+    console.log(`[shopify/order-paid] Order ${orderNumber} does not contain Foot Health Assessment booking. Ignored.`);
+    return res.status(200).json({ status: 'ignored', message: 'No assessment product in order' });
+  }
+
+  console.log(`[shopify/order-paid] Found Foot Health Assessment booking in order ${orderNumber} (${orderId})`);
+
+  // 4. Extract Custom Booking Properties
+  const properties = assessmentItem.properties || [];
+
+  // Patient Name
+  let patientName = extractBookingProperty(properties, [
+    'Patient Name', 
+    'Patient', 
+    'Full Name', 
+    'Name', 
+    'patient_name',
+    'patient'
+  ]);
+  if (!patientName) {
+    const customer = order.customer || {};
+    const fullName = `${customer.first_name || ''} ${customer.last_name || ''}`.trim();
+    patientName = fullName || order.shipping_address?.name || order.billing_address?.name || 'Valued Patient';
+  }
+
+  // WhatsApp Number
+  let rawPhone = extractBookingProperty(properties, [
+    'WhatsApp Number', 
+    'WhatsApp', 
+    'Mobile Number', 
+    'Mobile', 
+    'Phone Number', 
+    'Phone',
+    'whatsapp_number',
+    'phone_number'
+  ]);
+  if (!rawPhone) {
+    rawPhone = order.customer?.phone || 
+      order.shipping_address?.phone || 
+      order.billing_address?.phone || 
+      order.phone || 
+      (order.customer?.default_address && order.customer.default_address.phone);
+  }
+  const formattedPhone = formatIndiaPhone(rawPhone);
+
+  // Appointment Date
+  const appointmentDate = extractBookingProperty(properties, [
+    'Appointment Date', 
+    'Date', 
+    'Booking Date', 
+    'appointment_date',
+    'booking_date'
+  ]) || 'Scheduled Date';
+
+  // Time Slot
+  const timeSlot = extractBookingProperty(properties, [
+    'Time Slot', 
+    'Slot', 
+    'Time', 
+    'Session Time', 
+    'time_slot',
+    'booking_time'
+  ]) || 'Scheduled Time';
+
+  // Amount Paid
+  const rawAmount = order.current_total_price || order.total_price || assessmentItem.price || '99';
+  const cleanAmount = String(rawAmount).replace(/^(INR|₹)\s*/i, '').trim();
+
+  // Mark as processed immediately in deduplication cache
+  markBookingProcessed(orderId, {
+    orderNumber,
+    phone: formattedPhone,
+    patientName,
+    appointmentDate,
+    timeSlot,
+    amount: cleanAmount
+  });
+
+  // Send 200 response to Shopify
+  res.status(200).json({ 
+    success: true, 
+    orderId, 
+    orderNumber,
+    patientName,
+    phone: formattedPhone
+  });
+
+  if (!formattedPhone) {
+    console.warn(`[shopify/order-paid] No phone number found for booking in order ${orderNumber}`);
+    return;
+  }
+
+  // 5. Send WhatsApp Booking Confirmation Message
+  try {
+    await sendBookingConfirmationMessage({
+      to: formattedPhone,
+      patientName,
+      orderId: orderNumber,
+      appointmentDate,
+      timeSlot,
+      amount: cleanAmount
+    });
+    console.log(`[shopify/order-paid] Successfully sent booking confirmation to ${formattedPhone} for ${orderNumber}`);
+  } catch (err) {
+    console.error(`[shopify/order-paid] Failed to send booking confirmation to ${formattedPhone}:`, err.message);
+  }
+};
+
+// Mount Booking Webhook Endpoints
+router.post('/shopify/order-paid', handleShopifyOrderPaid);
+router.post('/orders/paid', handleShopifyOrderPaid); // Alias
+router.get('/bookings', (req, res) => {
+  res.status(200).json({ bookings: loadBookingsCache() });
 });
 
 module.exports = router;

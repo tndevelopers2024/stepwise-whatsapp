@@ -3,4 +3,5 @@ node_modules/
 tracking_cache.json
 cod_orders_cache.json
 shopify_tokens.json
+bookings_cache.json
 .DS_Store

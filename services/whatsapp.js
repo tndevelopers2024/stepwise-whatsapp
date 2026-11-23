@@ -260,10 +260,78 @@ const sendTextMessage = async (to, text) => {
   }
 };
 
+const sendBookingConfirmationMessage = async ({
+  to,
+  patientName,
+  orderId,
+  appointmentDate,
+  timeSlot,
+  amount
+}) => {
+  const cleanTo = String(to || '').replace(/\D/g, '');
+  // Strip currency symbol and trailing .00 so ₹{{5}} renders as ₹99 instead of ₹₹99.00
+  const cleanAmount = String(amount || '').replace(/^(INR|₹|\s)+/i, '').replace(/\.00$/, '').trim();
+  const mapsUrl = process.env.STEPWISE_CLINIC_MAPS_URL || 'https://maps.app.goo.gl/2HauavmrDLyvv9BZ6';
+  const bookingTemplateName = process.env.WHATSAPP_BOOKING_TEMPLATE_NAME || 'foot_health_assessment_booking';
+
+  // If an approved Meta utility template is configured, try template first
+  if (bookingTemplateName) {
+    try {
+      const templatePayload = {
+        messaging_product: 'whatsapp',
+        to: cleanTo,
+        type: 'template',
+        template: {
+          name: bookingTemplateName,
+          language: { code: WHATSAPP_TEMPLATE_LANG || 'en_US' },
+          components: [
+            {
+              type: 'body',
+              parameters: [
+                { type: 'text', text: patientName || 'Valued Patient' },
+                { type: 'text', text: orderId || '' },
+                { type: 'text', text: appointmentDate || 'Scheduled Date' },
+                { type: 'text', text: timeSlot || 'Scheduled Time' },
+                { type: 'text', text: cleanAmount || '99' }
+              ]
+            }
+          ]
+        }
+      };
+      const response = await axios.post(graphApiUrl, templatePayload, { headers: getHeaders() });
+      console.log(`[WhatsApp] Sent booking confirmation template "${bookingTemplateName}" to ${cleanTo}`);
+      return response.data;
+    } catch (templateError) {
+      console.warn('[WhatsApp] Booking template failed or not found, falling back to text message:', templateError.response?.data || templateError.message);
+    }
+  }
+
+  // Fallback text message matching the exact Meta approved template format
+  const messageText = 
+`*Booking Confirmed*
+
+Hello ${patientName || 'Valued Patient'},
+
+Your Foot Health Assessment (3D Optical Scan + Neuropathy Screening) at StepWise Health is confirmed!
+
+Booking Details:
+• Order ID: ${orderId}
+• Appointment Date: ${appointmentDate}
+• Time Slot: ${timeSlot}
+• Session Duration: Approx. 15–20 minutes (Painless & Non-Invasive)
+• Amount Paid: ₹${cleanAmount || '99'}
+
+Google Maps:
+${mapsUrl}`;
+
+  return sendTextMessage(cleanTo, messageText);
+};
+
 module.exports = {
   sendOrderTemplate,
   sendOrderShippedTemplate,
   sendOrderShippedTrackingTemplate,
   sendCodOrderConfirmation,
-  sendTextMessage
+  sendTextMessage,
+  sendBookingConfirmationMessage
 };

@@ -82,7 +82,8 @@ SHOPIFY_API_VERSION=2024-01
 ## Endpoints
 
 ### Shopify Webhooks
-- `POST /api/webhooks/orders/create` - Triggered when a new order is placed in Shopify.
+- `POST /api/webhooks/orders/create` - Triggered when a new order is placed in Shopify (COD confirmation / tracking).
+- `POST /api/webhooks/shopify/order-paid` (or `/api/webhooks/orders/paid`) - Triggered when an order is paid; automatically detects "Foot Health Assessment" bookings, validates HMAC signature, extracts custom properties, deduplicates, and sends the appointment confirmation WhatsApp message.
 - `POST /api/webhooks/orders/fulfilled` - Triggered when an order is fulfilled.
 - `POST /api/webhooks/orders/updated` - Triggered when tracking details are updated.
 
@@ -93,7 +94,9 @@ SHOPIFY_API_VERSION=2024-01
 ### Testing Endpoints
 - `POST /api/whatsapp/order-confirmation` - Manually trigger prepaid template confirmation.
 - `POST /api/whatsapp/cod-confirmation` - Manually test COD confirmation message with interactive buttons.
+- `POST /api/whatsapp/booking-confirmation` - Manually test Foot Health Assessment booking confirmation.
 - `GET /api/webhooks/cod-orders` - Inspect cached COD orders and their current status (`pending`, `confirmed`, `cancelled`).
+- `GET /api/webhooks/bookings` - Inspect cached assessment booking records.
 
 ---
 
